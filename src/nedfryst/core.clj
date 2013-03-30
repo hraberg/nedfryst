@@ -68,6 +68,9 @@
 (defn probable-var-name [cn]
   (symbol (s/replace (.replaceFirst (classname cn) "\\$" "/") "_" "-")))
 
+;; Probably want to look closer at what the right way to restore these are.
+;; There's kind of an assumption that these will already been loaded before restoring/checkpoint.
+;; But probably still needs to be resolved properly as they won't have a stable class.
 (defn has-source? [name]
   (when-let [file (:file (meta (resolve (probable-var-name name))))]
     (not= "NO_SOURCE_FILE" file)))
@@ -112,8 +115,6 @@
 (defn dont-store-classes []
   (.removeTransformer instrumentation class-store-transformer))
 
-
-
 (def clojure-reader-serializer
   (proxy [Serializer] []
     (write [k out o]
@@ -123,7 +124,6 @@
 
 (def kryo (Kryo.))
 (def frozen-classes-written (atom {}))
-
 
 (doto kryo
   (.setClassLoader (RT/baseLoader))
