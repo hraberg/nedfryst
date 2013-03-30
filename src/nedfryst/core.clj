@@ -25,8 +25,13 @@
 (defn -agentmain [^String args ^Instrumentation instrumentation]
   (def instrumentation instrumentation))
 
+(defn classname [c]
+  (cond (instance? Class c) (.getName c)
+        (string? c) c
+        :else (classname (type c))))
+
 (defn class-as-resource [cn]
-  (let [cn (if (instance? Class cn) (.getName cn) cn)]
+  (let [cn (classname cn)]
     (io/resource (str (s/replace cn "." "/") ".class"))))
 
 (defn agent-jar []
@@ -54,19 +59,43 @@
 
 (defonce classes (atom {}))
 
-(defn store-size []
-  (reduce + (map (comp count val) @classes)))
-
 (defn clojure-class? [bytes]
   (re-find #"clojure/lang/" (String. bytes "ISO-8859-1")))
 
 (defn throwaway-eval? [name]
   (boolean (re-find #"\$eval\d+$" name)))
 
+(defn probable-var-name [cn]
+  (symbol (s/replace (.replaceFirst (classname cn) "\\$" "/") "_" "-")))
+
+(defn has-source? [name]
+  (when-let [file (:file (meta (resolve (probable-var-name name))))]
+    (not= "NO_SOURCE_FILE" file)))
+
+;; There was an idea here of having this as a record that got lost.
+(defrecord FrozenFn [classname bytes])
+
+(defn redefine-class
+  ([^FrozenFn frozen-fn] (redefine-class (.classname frozen-fn) (.bytes frozen-fn)))
+  ([name bytes]
+     (let [loader (RT/baseLoader)]
+       (try
+         (.loadClass loader name)
+         (catch ClassNotFoundException _
+           (.defineClass loader name bytes nil))))))
+
+(defn is-class? [bytes]
+  (= 0xCAFEBABE (Integer/toUnsignedLong (.getInt (ByteBuffer/wrap bytes)))))
+
+(defn freeze-fn [fn]
+  (let [cn (.getName (type fn))]
+    (when-let [bytes (@classes (s/replace cn "." "/"))]
+      (FrozenFn. cn bytes))))
+
 (defn class-store [loader name class-being-redefined
                    protection-domain classfile-buffer]
   (when (and (clojure-class? classfile-buffer)
-             (not ((some-fn class-as-resource throwaway-eval?) name)))
+             (not ((some-fn class-as-resource throwaway-eval? has-source?) name)))
     (swap! classes assoc name classfile-buffer)))
 
 (def class-store-transformer
@@ -91,8 +120,6 @@
       (.writeString out (pr-str o)))
     (read [k in o]
       (read-string (.readString in)))))
-
-(declare freeze-fn thaw-fn redefine-class)
 
 (def kryo (Kryo.))
 (def frozen-classes-written (atom {}))
@@ -165,20 +192,6 @@
   (.register LazySeq (proxy [FieldSerializer] [kryo LazySeq]
                        (write [k out o]
                          (proxy-super write k out (doall o))))))
-
-(defrecord FrozenFn [classname bytes])
-
-(defn redefine-class
-  ([^FrozenFn frozen-fn] (redefine-class (.classname frozen-fn) (.bytes frozen-fn)))
-  ([name bytes]
-     (let [loader (RT/baseLoader)]
-       (try
-         (.loadClass loader name)
-         (catch ClassNotFoundException _
-           (.defineClass loader name bytes nil))))))
-
-(defn is-class? [bytes]
-  (= 0xCAFEBABE (Integer/toUnsignedLong (.getInt (ByteBuffer/wrap bytes)))))
 
 (defn enable-freezing []
   (attach-agent)
