@@ -68,9 +68,9 @@
 (defn probable-var-name [cn]
   (symbol (s/replace (.replaceFirst (classname cn) "\\$" "/") "_" "-")))
 
-;; Probably want to look closer at what the right way to restore these are.
 ;; There's kind of an assumption that these will already been loaded before restoring/checkpoint.
-;; But probably still needs to be resolved properly as they won't have a stable class.
+;; This seems to work as expected, as long as the fn is already loaded, it gets resolved without any extra work.
+;; If we want to autoload it (we probably don't), we need to deal with it in the serializer.
 (defn has-source? [name]
   (when-let [file (:file (meta (resolve (probable-var-name name))))]
     (not= "NO_SOURCE_FILE" file)))
