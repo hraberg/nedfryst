@@ -2,7 +2,7 @@
 
 *En av de mest revolutionerande upptäckterna före den stora pesten var stasisfältet.* -- Mutant 2, Världsboken
 
-**An attempt to put Clojure namespaces, including anonymous functions, under stasis.**
+**An attempt to put Clojure namespaces, including functions without source, under stasis.**
 
 Highly non-functional and untested. It's primary a spike to see if I can reduce the startup time of [Deuce](https://github.com/hraberg/deuce) by dumping its state after loadup, similar in spirit to how [Emacs duz it](http://www.gnu.org/software/emacs/manual/html_node/elisp/Building-Emacs.html).
 
