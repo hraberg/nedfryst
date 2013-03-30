@@ -41,6 +41,9 @@ Then:
 
 [DMTCP: Distributed MultiThreaded CheckPointing](http://dmtcp.sourceforge.net/) Jason Ansel et al. 2008-13 - ".. is a tool to transparently checkpoint the state of multiple simultaneous applications"
 
+[Carbonite](https://github.com/revelytix/carbonite) Revelytix, 2011 - Clojure serialization library which uses Kryo 1.
+
+
 ## License
 
 Copyright © 2013 Håkan Råberg
