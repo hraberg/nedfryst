@@ -3,7 +3,7 @@
             [clojure.java.io :as io])
   (:import [java.net URL URLClassLoader]
            [java.nio ByteBuffer ByteOrder]
-           [java.io ByteArrayOutputStream]
+           [java.io ByteArrayOutputStream File]
            [java.util.zip GZIPOutputStream GZIPInputStream]
            [java.lang.management ManagementFactory]
            [java.lang.instrument Instrumentation ClassFileTransformer]
@@ -12,12 +12,14 @@
             FieldSerializer JavaSerializer]
            [com.esotericsoftware.kryo.io Input Output]
            [org.objenesis.strategy StdInstantiatorStrategy]
-           [clojure.lang RT Symbol Keyword IPersistentMap IPersistentCollection LazySeq AFunction$1 Fn Var Namespace])
+           [clojure.lang RT Symbol Keyword IPersistentMap IPersistentCollection
+            LazySeq AFunction$1 Fn Var Namespace DynamicClassLoader Reflector])
   (:gen-class
    :methods [^:static [premain [String java.lang.instrument.Instrumentation] void]
              ^:static [agentmain [String java.lang.instrument.Instrumentation] void]]))
 
-(declare instrumentation)
+(set! *warn-on-reflection* true)
+(declare ^Instrumentation instrumentation)
 
 (defn -premain [^String args ^Instrumentation instrumentation]
   (def instrumentation instrumentation))
@@ -25,8 +27,8 @@
 (defn -agentmain [^String args ^Instrumentation instrumentation]
   (def instrumentation instrumentation))
 
-(defn classname [c]
-  (cond (instance? Class c) (.getName c)
+(defn ^String classname [c]
+  (cond (instance? Class c) (.getName ^Class c)
         (string? c) c
         :else (classname (type c))))
 
@@ -34,16 +36,16 @@
   (let [cn (classname cn)]
     (io/resource (str (s/replace cn "." "/") ".class"))))
 
-(defn agent-jar []
-  (let [f (class-as-resource nedfryst.core)]
+(defn ^File agent-jar []
+  (let [^URL f (class-as-resource nedfryst.core)]
     (if (= "file" (.getProtocol f))
-      (some #(when (re-find #"nedfryst-.*.jar" (.getName %)) %) (file-seq (io/file "target")))
+      (some (fn [^File f] (when (re-find #"nedfryst-.*.jar" (.getName f)) f)) (file-seq (io/file "target")))
       (io/file (URL. (first (s/split (.getFile f) #"!")))))))
 
 (defn pid []
   (first (s/split (.getName (ManagementFactory/getRuntimeMXBean)) #"@")))
 
-(defonce tools-jar-loader
+(defonce ^URLClassLoader tools-jar-loader
   (URLClassLoader. (into-array URL [(.toURL (io/file (System/getProperty "java.home")
                                                      "../lib/tools.jar"))])))
 
@@ -54,12 +56,12 @@
 
 (defn attach-agent []
   (let [vm (vm)]
-    (.loadAgent vm (.getAbsolutePath (agent-jar)))
-    (.detach vm)))
+    (Reflector/invokeInstanceMember "loadAgent" vm (.getAbsolutePath (agent-jar)))
+    (Reflector/invokeNoArgInstanceMember vm "detach")))
 
 (defonce classes (atom {}))
 
-(defn clojure-class? [bytes]
+(defn clojure-class? [^bytes bytes]
   (re-find #"clojure/lang/" (String. bytes "ISO-8859-1")))
 
 (defn throwaway-eval? [name]
@@ -76,12 +78,12 @@
     (not= "NO_SOURCE_FILE" file)))
 
 ;; There was an idea here of having this as a record that got lost.
-(defrecord FrozenFn [classname bytes])
+(defrecord FrozenFn [^String classname ^bytes bytes])
 
 (defn redefine-class
   ([^FrozenFn frozen-fn] (redefine-class (.classname frozen-fn) (.bytes frozen-fn)))
   ([name bytes]
-     (let [loader (RT/baseLoader)]
+     (let [^DynamicClassLoader loader (RT/baseLoader)]
        (try
          (.loadClass loader name)
          (catch ClassNotFoundException _
@@ -91,7 +93,7 @@
   (= 0xCAFEBABE (Integer/toUnsignedLong (.getInt (ByteBuffer/wrap bytes)))))
 
 (defn freeze-fn [fn]
-  (let [cn (.getName (type fn))]
+  (let [cn (.getName ^Class (type fn))]
     (when-let [bytes (@classes (s/replace cn "." "/"))]
       (FrozenFn. cn bytes))))
 
@@ -115,15 +117,15 @@
 (defn dont-store-classes []
   (.removeTransformer instrumentation class-store-transformer))
 
-(def clojure-reader-serializer
+(def ^Serializer clojure-reader-serializer
   (proxy [Serializer] []
-    (write [k out o]
+    (write [k ^Output out o]
       (.writeString out (pr-str o)))
-    (read [k in o]
+    (read [k ^Input in o]
       (read-string (.readString in)))))
 
-(def kryo (Kryo.))
 (def frozen-classes-written (atom {}))
+(def ^Kryo kryo (Kryo.))
 
 (doto kryo
   (.setClassLoader (RT/baseLoader))
@@ -134,29 +136,33 @@
                          (doto (FieldSerializer. kryo clojure.lang.AFunction$1)
                            (.setIgnoreSyntheticFields false)))
   (.addDefaultSerializer Class (proxy [DefaultSerializers$ClassSerializer] []
-                                 (read [k in t]
-                                   (let [frozen (.readBoolean in)]
+                                 (read [^Kryo k ^Input in ^Class t]
+                                   (let [^DefaultSerializers$ClassSerializer this this
+                                         frozen (.readBoolean in)]
                                      (when frozen
                                        (redefine-class
                                         (.readString in)
                                         (.readBytes in (.readInt in))))
                                      (proxy-super read k in t)))
-                                 (write [k out o]
-                                   (let [frozen (@frozen-classes-written o)]
+                                 (write [^Kryo k ^Output out o]
+                                   (let [^DefaultSerializers$ClassSerializer this this
+                                         ^FrozenFn frozen (@frozen-classes-written o)]
                                      (.writeBoolean out (boolean frozen))
                                      (when frozen
-                                       (.writeString out (.classname frozen))
+                                       (.writeString out ^String (.classname frozen))
                                        (.writeInt out (count (.bytes frozen)))
                                        (.writeBytes out (.bytes frozen)))
                                      (proxy-super write k out o)))))
   (.addDefaultSerializer Fn (proxy [FieldSerializer] [kryo Fn]
-                              (write [k out o]
+                              (write [^Kryo k ^Output out o]
                                 (when-let [frozen (freeze-fn o)]
                                   (swap! frozen-classes-written assoc (type o) frozen))
-                                (proxy-super write k out o))))
+                                (let [^FieldSerializer this this]
+                                  (proxy-super write k out o)))))
   (.addDefaultSerializer Var (proxy [FieldSerializer] [kryo Var]
-                               (read [k in t]
-                                 (let [v (proxy-super read k in t)
+                               (read [^Kryo k ^Input in t]
+                                 (let [^FieldSerializer this this
+                                       ^Var v (proxy-super read k in t)
                                        {:keys [ns name]} (meta v)]
                                    (if-let [existing (and ns (ns-resolve (ns-name ns) name))]
                                      (doto existing
@@ -166,17 +172,19 @@
                                                (with-meta name (dissoc (meta v) :ns :name)) (.getRawRoot v))
                                        v))))))
   (.addDefaultSerializer Namespace (proxy [JavaSerializer] [];[kryo Namespace]
-                                     (write [k out o]
-                                       (proxy-super write k out o)
-                                       (let [resolvable-map #(into {} (map (fn [[k v]] [k (pr-str v)]) %))]
+                                     (write [^Kryo k ^Output out o]
+                                       (let [^JavaSerializer this this
+                                             resolvable-map #(into {} (map (fn [[k v]] [k (pr-str v)]) %))]
+                                         (proxy-super write k out o)
                                          (.writeClassAndObject k out (doall (vals (ns-publics o))))
                                          (.writeClassAndObject k out (resolvable-map (ns-imports o)))
                                          (.writeClassAndObject k out (resolvable-map (ns-refers o)))
                                          (.writeClassAndObject k out (resolvable-map (into {} (map (fn [[k v]] [k (ns-name v)])
                                                                                                    (ns-aliases o)))))))
-                                     (read [k in t]
-                                       (let [ns (proxy-super read k in t)]
-                                         (doseq [v (.readClassAndObject k in)]
+                                     (read [^Kryo k ^Input in t]
+                                       (let [^JavaSerializer this this
+                                             ^Namespace ns (proxy-super read k in t)]
+                                         (doseq [^Var v (.readClassAndObject k in)]
                                            (intern ns (with-meta (-> v meta :name)
                                                         (dissoc (meta v) :ns :name))
                                                    (.getRawRoot v)))
@@ -190,8 +198,9 @@
   (.register Symbol clojure-reader-serializer)
   (.register Keyword clojure-reader-serializer)
   (.register LazySeq (proxy [FieldSerializer] [kryo LazySeq]
-                       (write [k out o]
-                         (proxy-super write k out (doall o))))))
+                       (write [^Kryo k ^Output out o]
+                         (let [^FieldSerializer this this]
+                           (proxy-super write k out (doall o)))))))
 
 (defn enable-freezing []
   (attach-agent)
