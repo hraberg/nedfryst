@@ -1,4 +1,4 @@
-(defproject nedfryst "0.1.0-SNAPSHOT"
+(defproject nedfryst "0.1.0"
   :description "An attempt to put Clojure namespaces, including functions without source, under statsis."
   :url "https://github.com/hraberg/nedfryst"
   :license {:name "Eclipse Public License"

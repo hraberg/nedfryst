@@ -102,7 +102,7 @@
                    protection-domain classfile-buffer]
   (when (and (clojure-class? classfile-buffer)
              (not ((some-fn class-as-resource throwaway-eval? has-source?) name)))
-    (swap! classes assoc name classfile-buffer)))
+    (swap! classes assoc (s/replace name "/" ".") (FrozenFn. (s/replace name "/" ".") classfile-buffer))))
 
 (def class-store-transformer
   (proxy [ClassFileTransformer] []
@@ -121,12 +121,14 @@
 (def ^Serializer clojure-reader-serializer
   (proxy [Serializer] []
     (write [k ^Output out o]
-      (.writeString out (pr-str o)))
+      (binding [*print-dup* true]
+        (.writeString out (pr-str o))))
     (read [k ^Input in o]
       (read-string (.readString in)))))
 
-(def frozen-classes-written (atom {}))
 (def ^Kryo kryo (Kryo.))
+
+(def ^:dynamic *write-full-ns* false)
 
 (doto kryo
   (.setClassLoader (RT/baseLoader))
@@ -142,65 +144,43 @@
   (.addDefaultSerializer AFunction$1
                          (doto (FieldSerializer. kryo AFunction$1)
                            (.setIgnoreSyntheticFields false)))
-  (.addDefaultSerializer Class (proxy [DefaultSerializers$ClassSerializer] []
-                                 (read [^Kryo k ^Input in ^Class t]
-                                   (let [^DefaultSerializers$ClassSerializer this this
-                                         frozen (.readBoolean in)]
-                                     (when frozen
-                                       (redefine-class
-                                        (.readString in)
-                                        (.readBytes in (.readInt in))))
-                                     (proxy-super read k in t)))
-                                 (write [^Kryo k ^Output out o]
-                                   (let [^DefaultSerializers$ClassSerializer this this
-                                         ^FrozenFn frozen (@frozen-classes-written o)]
-                                     (.writeBoolean out (boolean frozen))
-                                     (when frozen
-                                       (.writeString out ^String (.classname frozen))
-                                       (.writeInt out (count (.bytes frozen)))
-                                       (.writeBytes out (.bytes frozen)))
-                                     (proxy-super write k out o)))))
-  (.addDefaultSerializer Fn (proxy [FieldSerializer] [kryo Fn]
-                              (write [^Kryo k ^Output out o]
-                                (when-let [frozen (freeze-fn o)]
-                                  (swap! frozen-classes-written assoc (type o) frozen))
-                                (let [^FieldSerializer this this]
-                                  (proxy-super write k out o)))))
-  (.addDefaultSerializer Var (proxy [FieldSerializer] [kryo Var]
-                               (read [^Kryo k ^Input in t]
-                                 (let [^FieldSerializer this this
-                                       ^Var v (proxy-super read k in t)
-                                       {:keys [ns name]} (meta v)]
-                                   (if-let [existing (and ns (ns-resolve (ns-name ns) name))]
-                                     (doto existing
-                                       (alter-var-root (constantly (.getRawRoot v))))
-                                     (if ns
-                                       (intern (create-ns (ns-name ns))
-                                               (with-meta name (dissoc (meta v) :ns :name)) (.getRawRoot v))
-                                       v))))))
   (.addDefaultSerializer Namespace (proxy [FieldSerializer] [kryo Namespace]
                                      (write [^Kryo k ^Output out o]
                                        (let [^FieldSerializer this this
                                              resolvable-map #(into {} (map (fn [[k v]] [k (pr-str v)]) %))]
                                          (proxy-super write k out o)
-                                         (.writeClassAndObject k out (ns-publics o))
-                                         (.writeClassAndObject k out (resolvable-map (ns-imports o)))
-                                         (.writeClassAndObject k out (resolvable-map (ns-refers o)))
-                                         (.writeClassAndObject k out (resolvable-map (into {} (map (fn [[k v]] [k (ns-name v)])
-                                                                                                   (ns-aliases o)))))))
+                                         (.writeInt out (count (ns-publics o)))
+                                         (doseq [[key v] (ns-publics o)]
+                                           (.writeClassAndObject k out key)
+                                           (.writeClassAndObject k out v))
+                                         (when *write-full-ns*
+                                           (.writeClassAndObject k out (resolvable-map (ns-imports o)))
+                                           (.writeClassAndObject k out (resolvable-map (ns-refers o)))
+                                           (.writeClassAndObject k out (resolvable-map (into {} (map (fn [[k v]] [k (ns-name v)])
+                                                                                                     (ns-aliases o))))))))
                                      (read [^Kryo k ^Input in t]
                                        (let [^FieldSerializer this this
                                              ^Namespace ns (create-ns (ns-name (proxy-super read k in t)))]
-                                         (doseq [[k ^Var v] (.readClassAndObject k in)]
-                                           (intern ns (with-meta (-> v meta :name)
-                                                        (dissoc (meta v) :ns :name))
-                                                   (.getRawRoot v)))
-                                         (doseq [[k v] (.readClassAndObject k in)]
-                                           (.importClass ns k (resolve (read-string v))))
-                                         (doseq [[k v] (.readClassAndObject k in)]
-                                           (.refer ns k (resolve (second (read-string v)))))
-                                         (doseq [[k v] (.readClassAndObject k in)]
-                                           (.addAlias ns k (the-ns (read-string v))))
+                                         (dotimes [n (.readInt in)]
+                                           (let  [key (.readClassAndObject k in)]
+                                             (let [^Var v (.readClassAndObject k in)
+                                                   dynamic? (.isDynamic v)
+                                                   _ (ns-unmap ns key)
+                                                   ^Var v (intern ns (if v
+                                                                       (with-meta key (dissoc (meta v) :ns :name))
+                                                                       key)
+                                                                  (when v
+                                                                    (.getRawRoot v)))]
+                                               (when dynamic?
+                                                 (.setDynamic v)))))
+                                         (when *write-full-ns*
+                                           (doseq [[k v] (.readClassAndObject k in)]
+                                             (.importClass ns k (resolve (read-string v))))
+                                           (doseq [[k v] (.readClassAndObject k in)]
+                                             (ns-unmap ns k)
+                                             (.refer ns k (resolve (second (read-string v)))))
+                                           (doseq [[k v] (.readClassAndObject k in)]
+                                             (.addAlias ns k (the-ns (read-string v)))))
                                          ns))))
   (.register Symbol clojure-reader-serializer)
   (.register Keyword clojure-reader-serializer)
@@ -221,18 +201,16 @@
     x))
 
 (defn freeze [x file]
-  (try
-    (reset! frozen-classes-written {})
-    (let [buffer (Output. (ByteArrayOutputStream.))]
-      (.writeClassAndObject kryo buffer x)
+  (with-open [out (Output. (GZIPOutputStream. (io/output-stream (io/file file))))]
+    (.writeClassAndObject kryo out (doall (vals @classes)))
+    (.writeClassAndObject kryo out (maybe-realize x))))
 
-      (with-open [out (Output. (GZIPOutputStream. (io/output-stream (io/file file))))]
-        (.writeClassAndObject kryo out (doall (keys @frozen-classes-written)))
-        (.writeClassAndObject kryo out (maybe-realize x))))
-    (finally
-     (reset! frozen-classes-written {}))))
+(defn file-or-resource [f]
+  (if (.exists (io/file f))
+    (io/file f)
+    (io/resource f)))
 
 (defn thaw [file]
-  (with-open [in (Input. (GZIPInputStream. (io/input-stream (io/file file))))]
-    (maybe-realize (.readClassAndObject kryo in))
+  (with-open [in (Input. (GZIPInputStream. (io/input-stream (file-or-resource file))))]
+    (dorun (map redefine-class (maybe-realize (.readClassAndObject kryo in))))
     (maybe-realize (.readClassAndObject kryo in))))
