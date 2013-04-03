@@ -13,7 +13,8 @@
            [com.esotericsoftware.kryo.io Input Output]
            [org.objenesis.strategy StdInstantiatorStrategy]
            [clojure.lang RT Symbol Keyword IPersistentMap IPersistentCollection
-            LazySeq AFunction$1 Fn Var Namespace DynamicClassLoader Reflector])
+            LazySeq AFunction$1 Fn Var Namespace DynamicClassLoader Reflector
+            PersistentHashMap$BitmapIndexedNode PersistentHashMap$ArrayNode])
   (:gen-class
    :methods [^:static [premain [String java.lang.instrument.Instrumentation] void]
              ^:static [agentmain [String java.lang.instrument.Instrumentation] void]]))
@@ -132,8 +133,14 @@
   (.setInstantiatorStrategy (StdInstantiatorStrategy.))
   (.addDefaultSerializer IPersistentMap FieldSerializer)
   (.addDefaultSerializer IPersistentCollection FieldSerializer)
-  (.addDefaultSerializer clojure.lang.AFunction$1
-                         (doto (FieldSerializer. kryo clojure.lang.AFunction$1)
+  (.addDefaultSerializer PersistentHashMap$ArrayNode
+                         (doto (FieldSerializer. kryo PersistentHashMap$ArrayNode)
+                           (.setIgnoreSyntheticFields false)))
+  (.addDefaultSerializer PersistentHashMap$BitmapIndexedNode
+                         (doto (FieldSerializer. kryo PersistentHashMap$BitmapIndexedNode)
+                           (.setIgnoreSyntheticFields false)))
+  (.addDefaultSerializer AFunction$1
+                         (doto (FieldSerializer. kryo AFunction$1)
                            (.setIgnoreSyntheticFields false)))
   (.addDefaultSerializer Class (proxy [DefaultSerializers$ClassSerializer] []
                                  (read [^Kryo k ^Input in ^Class t]
@@ -171,20 +178,20 @@
                                        (intern (create-ns (ns-name ns))
                                                (with-meta name (dissoc (meta v) :ns :name)) (.getRawRoot v))
                                        v))))))
-  (.addDefaultSerializer Namespace (proxy [JavaSerializer] [];[kryo Namespace]
+  (.addDefaultSerializer Namespace (proxy [FieldSerializer] [kryo Namespace]
                                      (write [^Kryo k ^Output out o]
-                                       (let [^JavaSerializer this this
+                                       (let [^FieldSerializer this this
                                              resolvable-map #(into {} (map (fn [[k v]] [k (pr-str v)]) %))]
                                          (proxy-super write k out o)
-                                         (.writeClassAndObject k out (doall (vals (ns-publics o))))
+                                         (.writeClassAndObject k out (ns-publics o))
                                          (.writeClassAndObject k out (resolvable-map (ns-imports o)))
                                          (.writeClassAndObject k out (resolvable-map (ns-refers o)))
                                          (.writeClassAndObject k out (resolvable-map (into {} (map (fn [[k v]] [k (ns-name v)])
                                                                                                    (ns-aliases o)))))))
                                      (read [^Kryo k ^Input in t]
-                                       (let [^JavaSerializer this this
-                                             ^Namespace ns (proxy-super read k in t)]
-                                         (doseq [^Var v (.readClassAndObject k in)]
+                                       (let [^FieldSerializer this this
+                                             ^Namespace ns (create-ns (ns-name (proxy-super read k in t)))]
+                                         (doseq [[k ^Var v] (.readClassAndObject k in)]
                                            (intern ns (with-meta (-> v meta :name)
                                                         (dissoc (meta v) :ns :name))
                                                    (.getRawRoot v)))
@@ -208,6 +215,11 @@
 
 (defn -main [& args])
 
+(defn maybe-realize [x]
+  (if (seq? x)
+    (doall x)
+    x))
+
 (defn freeze [x file]
   (try
     (reset! frozen-classes-written {})
@@ -216,11 +228,11 @@
 
       (with-open [out (Output. (GZIPOutputStream. (io/output-stream (io/file file))))]
         (.writeClassAndObject kryo out (doall (keys @frozen-classes-written)))
-        (.writeClassAndObject kryo out x)))
+        (.writeClassAndObject kryo out (maybe-realize x))))
     (finally
      (reset! frozen-classes-written {}))))
 
 (defn thaw [file]
   (with-open [in (Input. (GZIPInputStream. (io/input-stream (io/file file))))]
-    (.readClassAndObject kryo in)
-    (.readClassAndObject kryo in)))
+    (maybe-realize (.readClassAndObject kryo in))
+    (maybe-realize (.readClassAndObject kryo in))))
