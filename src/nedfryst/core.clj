@@ -5,6 +5,7 @@
            [java.nio ByteBuffer ByteOrder]
            [java.io ByteArrayOutputStream File]
            [java.util.zip GZIPOutputStream GZIPInputStream]
+           [java.lang.reflect Method]
            [java.lang.management ManagementFactory]
            [java.lang.instrument Instrumentation ClassFileTransformer]
            [com.esotericsoftware.kryo Kryo Serializer]
@@ -149,10 +150,7 @@
                                        (let [^FieldSerializer this this
                                              resolvable-map #(into {} (map (fn [[k v]] [k (pr-str v)]) %))]
                                          (proxy-super write k out o)
-                                         (.writeInt out (count (ns-publics o)))
-                                         (doseq [[key v] (ns-publics o)]
-                                           (.writeClassAndObject k out key)
-                                           (.writeClassAndObject k out v))
+                                         (.writeClassAndObject k out (ns-publics o))
                                          (when *write-full-ns*
                                            (.writeClassAndObject k out (resolvable-map (ns-imports o)))
                                            (.writeClassAndObject k out (resolvable-map (ns-refers o)))
@@ -161,18 +159,18 @@
                                      (read [^Kryo k ^Input in t]
                                        (let [^FieldSerializer this this
                                              ^Namespace ns (create-ns (ns-name (proxy-super read k in t)))]
-                                         (dotimes [n (.readInt in)]
-                                           (let  [key (.readClassAndObject k in)]
-                                             (let [^Var v (.readClassAndObject k in)
-                                                   dynamic? (.isDynamic v)
-                                                   _ (ns-unmap ns key)
-                                                   ^Var v (intern ns (if v
-                                                                       (with-meta key (dissoc (meta v) :ns :name))
-                                                                       key)
-                                                                  (when v
-                                                                    (.getRawRoot v)))]
-                                               (when dynamic?
-                                                 (.setDynamic v)))))
+                                         (->> (.readClassAndObject k in)
+                                              (pmap (fn  [[k ^Var v] ]
+                                                      (let [dynamic? (.isDynamic v)
+                                                            _ (ns-unmap ns k)
+                                                            ^Var v (intern ns (if v
+                                                                                (with-meta k (dissoc (meta v) :ns :name))
+                                                                                k)
+                                                                           (when v
+                                                                             (.getRawRoot v)))]
+                                                        (when dynamic?
+                                                          (.setDynamic v)))))
+                                              dorun)
                                          (when *write-full-ns*
                                            (doseq [[k v] (.readClassAndObject k in)]
                                              (.importClass ns k (resolve (read-string v))))
@@ -201,8 +199,8 @@
     x))
 
 (defn freeze [x file]
-  (with-open [out (Output. (GZIPOutputStream. (io/output-stream (io/file file))))]
-    (.writeClassAndObject kryo out (doall (vals @classes)))
+  (with-open [out (Output. (io/output-stream (io/file file)))]
+    (.writeClassAndObject kryo out (object-array (vals @classes)))
     (.writeClassAndObject kryo out (maybe-realize x))))
 
 (defn file-or-resource [f]
@@ -210,7 +208,24 @@
     (io/file f)
     (io/resource f)))
 
+(def ^Method resolve-class
+  (doto (.getDeclaredMethod ClassLoader "resolveClass" (into-array [Class]))
+    (.setAccessible true)))
+
+(def ^Method define-class
+  (doto (.getDeclaredMethod ClassLoader "defineClass" (into-array [String (type (byte-array 0))
+                                                                   Integer/TYPE Integer/TYPE]))
+    (.setAccessible true)))
+
+(defn inject-class [loader ^FrozenFn frozen-fn]
+  (let [c (.invoke define-class loader
+                   (object-array [(.classname frozen-fn) (.bytes frozen-fn)
+                                  (int 0) (int (count (.bytes frozen-fn)))]))]
+    (.invoke resolve-class loader (object-array [c]))
+    c))
+
 (defn thaw [file]
-  (with-open [in (Input. (GZIPInputStream. (io/input-stream (file-or-resource file))))]
-    (dorun (map redefine-class (maybe-realize (.readClassAndObject kryo in))))
+  (with-open [in (Input. (io/input-stream (file-or-resource file)))]
+    (doall (pmap (partial inject-class (ClassLoader/getSystemClassLoader))
+                 (maybe-realize (.readClassAndObject kryo in))))
     (maybe-realize (.readClassAndObject kryo in))))
