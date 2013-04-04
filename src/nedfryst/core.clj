@@ -1,12 +1,13 @@
 (ns nedfryst.core
   (:require [clojure.string :as s]
             [clojure.java.io :as io]
+            [clojure.walk :as w]
             [taoensso.nippy.utils]
             [taoensso.nippy :as nippy]
             [nedfryst.nippy])
   (:import [java.net URL URLClassLoader]
            [java.nio ByteBuffer ByteOrder]
-           [java.io ByteArrayOutputStream File]
+           [java.io ByteArrayInputStream ByteArrayOutputStream DataInputStream DataOutputStream File InputStream OutputStream]
            [java.util.zip GZIPOutputStream GZIPInputStream]
            [java.lang.reflect Method]
            [java.lang.management ManagementFactory]
@@ -91,16 +92,11 @@
 (defn is-class? [bytes]
   (= 0xCAFEBABE (Integer/toUnsignedLong (.getInt (ByteBuffer/wrap bytes)))))
 
-(defn freeze-fn [fn]
-  (let [cn (.getName ^Class (type fn))]
-    (when-let [bytes (@classes (s/replace cn "." "/"))]
-      (FrozenFn. cn bytes))))
-
 (defn class-store [loader name class-being-redefined
                    protection-domain classfile-buffer]
   (when (and (clojure-class? classfile-buffer)
              (not ((some-fn class-as-resource throwaway-eval? has-source?) name)))
-    (swap! classes assoc (s/replace name "/" ".") (FrozenFn. (s/replace name "/" ".") classfile-buffer))))
+    (swap! classes assoc name (FrozenFn. (s/replace name "/" ".") classfile-buffer))))
 
 (def class-store-transformer
   (proxy [ClassFileTransformer] []
@@ -121,7 +117,7 @@
   (store-classes))
 
 
-;; Serializer
+;; Kryo-bsed Serializer
 
 (def ^:dynamic *write-full-ns* false)
 
@@ -195,48 +191,85 @@
                          (let [^FieldSerializer this this]
                            (proxy-super write k out (doall o)))))))
 
-(defn -main [& args])
+;; API
 
-(defn maybe-realize [x]
+(defn ^:private maybe-realize [x]
   (if (seq? x)
     (doall x)
     x))
 
-(defn freeze [x out]
-  (let [^Output out (if (instance? Output out) out (Output. (io/output-stream (io/file out))))]
+(defn ^:private maybe-file-or-resource [f]
+  (if (string? f)
+    (if (.exists (io/file f))
+      (io/file f)
+      (if (io/resource f)
+        (io/resource f)
+        f))
+    f))
+
+(def ^:dynamic *nedfryst-loader* (ClassLoader/getSystemClassLoader))
+
+(def ^:private ^Method resolve-class
+  (doto (.getDeclaredMethod ClassLoader "resolveClass" (into-array [Class]))
+    (.setAccessible true)))
+
+(def ^:private ^Method define-class
+  (doto (.getDeclaredMethod ClassLoader "defineClass" (into-array [String (type (byte-array 0))
+                                                                   Integer/TYPE Integer/TYPE]))
+    (.setAccessible true)))
+
+(defn ^:private inject-class [loader {:keys [classname bytes]}]
+  (let [c (.invoke define-class loader
+                   (object-array [classname bytes
+                                  (int 0) (int (count bytes))]))]
+    (.invoke resolve-class loader (object-array [c]))
+    c))
+
+;; We freeze all clasess - we cannot just freeze the fns we encounter, as they can contain references to further fns.
+(defn kryo-freeze [x out]
+  (let [out (Output. (if (instance? OutputStream out) ^OutputStream out (io/output-stream (io/file out))))]
     (with-open [out out]
       (.writeClassAndObject kryo out (object-array (vals @classes)))
       (.writeClassAndObject kryo out (maybe-realize x)))
     x))
 
-(defn file-or-resource [f]
-  (if (.exists (io/file f))
-    (io/file f)
-    (io/resource f)))
-
-(def ^Method resolve-class
-  (doto (.getDeclaredMethod ClassLoader "resolveClass" (into-array [Class]))
-    (.setAccessible true)))
-
-(def ^Method define-class
-  (doto (.getDeclaredMethod ClassLoader "defineClass" (into-array [String (type (byte-array 0))
-                                                                   Integer/TYPE Integer/TYPE]))
-    (.setAccessible true)))
-
-(defn inject-class [loader ^FrozenFn frozen-fn]
-  (let [c (.invoke define-class loader
-                   (object-array [(.classname frozen-fn) (.bytes frozen-fn)
-                                  (int 0) (int (count (.bytes frozen-fn)))]))]
-    (.invoke resolve-class loader (object-array [c]))
-    c))
-
-(defn thaw [in]
-  (with-open [in (if (instance? Input in) ^Input in (Input. (io/input-stream (file-or-resource in))))]
-    (doall (map (partial inject-class (ClassLoader/getSystemClassLoader))
+(defn kryo-thaw [in]
+  (with-open [in (Input. (io/input-stream (maybe-file-or-resource in)))]
+    (doall (map (partial inject-class *nedfryst-loader*)
                 (maybe-realize (.readClassAndObject kryo in))))
     (maybe-realize (.readClassAndObject kryo in))))
 
+;; Nippy-based Serializer, uses nedfryst.nippy for Nippy with Namespace support.
+;; Doesn't handle identity/resolving of repeated objects.
+
+(defn nippy-freeze [x out]
+  (with-open [out (DataOutputStream. (if (instance? OutputStream out)
+                                       out
+                                       (io/output-stream (io/file out))))]
+    (nippy/freeze-to-stream! out (maybe-realize (vals @classes)))
+    (time (nippy/freeze-to-stream! out (maybe-realize x))))
+  x)
+
+(defn nippy-thaw [in]
+  (with-open [in (DataInputStream. (io/input-stream (maybe-file-or-resource in)))]
+    (doall (map (partial inject-class *nedfryst-loader*)
+                (nippy/thaw-from-stream! in true)))
+    (maybe-realize (nippy/thaw-from-stream! in true))))
+
+(defn use-kryo! []
+  (def freeze kryo-freeze)
+  (def thaw kryo-thaw))
+
+(defn use-nippy! []
+  (def freeze nippy-freeze)
+  (def thaw nippy-thaw))
+
+(use-nippy!)
+
+;; For testing
 (defn roundtrip [x]
   (let [baos (ByteArrayOutputStream.)]
-    (freeze x (Output. baos))
-    (thaw (Input. (.toByteArray baos)))))
+    (freeze x baos)
+    (thaw (ByteArrayInputStream. (.toByteArray baos)))))
+
+(defn -main [& args])
