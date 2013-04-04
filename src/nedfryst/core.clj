@@ -1,6 +1,9 @@
 (ns nedfryst.core
   (:require [clojure.string :as s]
-            [clojure.java.io :as io])
+            [clojure.java.io :as io]
+            [taoensso.nippy.utils]
+            [taoensso.nippy :as nippy]
+            [nedfryst.nippy])
   (:import [java.net URL URLClassLoader]
            [java.nio ByteBuffer ByteOrder]
            [java.io ByteArrayOutputStream File]
