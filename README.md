@@ -43,6 +43,8 @@ Then:
 
 [Carbonite](https://github.com/revelytix/carbonite) Revelytix, 2011 - Clojure serialization library which uses Kryo 1.
 
+[Nippy](https://github.com/ptaoussanis/nippy) Peter Taoussanis, 2012 - "Nippy is an attempt to provide a drop-in, high-performance alternative to the reader. It's a fork of [Deep-Freeze](https://github.com/halgari/deep-freeze) [..]"
+
 
 ## License
 
