@@ -1,8 +1,9 @@
 (ns taoensso.nippy
-  (:require [taoensso.nippy.utils :as utils])
+  (:require [taoensso.nippy.utils :as utils]
+            [clojure.string :as s])
   (:import [java.io DataInputStream DataOutputStream]
            [java.lang.reflect Modifier]
-           [clojure.lang IObj Var Atom Namespace PersistentQueue AFunction$1 AFunction]))
+           [clojure.lang IObj Var Atom Namespace PersistentQueue AFunction$1 AFunction IRecord IPersistentMap]))
 
 ;;;; Define type IDs
 
@@ -50,6 +51,19 @@
 
 (coll-freezer (type (object-array 0)) id-object-array)
 
+;; Reuse map for IRecords as the extend-type seems to collide.
+(freezer IPersistentMap id-map
+         (freeze-to-stream!* s (when (instance? IRecord x) (type x)))
+         (.writeInt s (* 2 (count x))) ; Encode num kvs
+         (doseq [[k v] x]
+           (freeze-to-stream!* s k)
+           (freeze-to-stream!* s v)))
+
+(defn recreate-record [t m]
+  (let [package (.getName (.getPackage t))
+        name (.getSimpleName t)]
+    ((ns-resolve (symbol package) (symbol (str "map->" name))) m)))
+
 ;; The unmarshalling isn't very exsensible. This is almost an exact copy from taoensso.nippy.
 ;; Note: Nippy doesn't handle identity, might need to add back reference mechanism?
 (defn- thaw-from-stream!*
@@ -70,7 +84,11 @@
      id-list    (apply list (coll-thaw! s)) ; TODO OOMs for big colls
      id-vector  (into  [] (coll-thaw! s))
      id-set     (into #{} (coll-thaw! s))
-     id-map     (into  {} (coll-thaw-pairs! s))
+     id-map     (let [record-type (thaw-from-stream!* s)
+                      m (into  {} (coll-thaw-pairs! s))]
+                  (if record-type
+                    (recreate-record record-type m)
+                    m))
      id-coll    (doall (coll-thaw! s))
      id-queue   (into  (PersistentQueue/EMPTY) (coll-thaw! s))
 
@@ -110,14 +128,13 @@
              ns)
      id-afunction$1 (thaw-from-stream!* s)
 
-     id-afunction (let [t  (thaw-from-stream!* s)
+     id-afunction (let [t (thaw-from-stream!* s)
                         vars (thaw-from-stream!* s)
                         ctor (first (filter #(= vars (count (.getParameterTypes %)))
                                             (.getDeclaredConstructors t)))]
                     (.newInstance ctor (object-array (repeatedly vars #(thaw-from-stream!* s)))))
 
      id-object-array  (object-array (coll-thaw! s))
-
 
      ;;; DEPRECATED
      id-old-reader (read-string (.readUTF s))
