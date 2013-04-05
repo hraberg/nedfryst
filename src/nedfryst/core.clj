@@ -241,17 +241,19 @@
 
 ;; Nippy-based Serializer, uses nedfryst.nippy for Nippy with Namespace support.
 ;; Doesn't handle identity/resolving of repeated objects.
-
+;; Nippy uses Snappy to do compression, but we add GZIP as the Deuce dump becomes ~12Gb.
+;; A cause of that might be CharTables (used in keymaps) and hence object-arrays, their length is 4194303.
+;; But still seems execcsively large. The dump does finish (after ~1h) so it doesn't seem to be circular references.
 (defn nippy-freeze [x out]
-  (with-open [out (DataOutputStream. (if (instance? OutputStream out)
-                                       out
-                                       (io/output-stream (io/file out))))]
+  (with-open [out (DataOutputStream. (GZIPOutputStream. (if (instance? OutputStream out)
+                                                          out
+                                                          (io/output-stream (io/file out)))))]
     (nippy/freeze-to-stream! out (maybe-realize (vals @classes)))
     (time (nippy/freeze-to-stream! out (maybe-realize x))))
   x)
 
 (defn nippy-thaw [in]
-  (with-open [in (DataInputStream. (io/input-stream (maybe-file-or-resource in)))]
+  (with-open [in (DataInputStream. (GZIPInputStream. (io/input-stream (maybe-file-or-resource in))))]
     (doall (map (partial inject-class *nedfryst-loader*)
                 (nippy/thaw-from-stream! in true)))
     (maybe-realize (nippy/thaw-from-stream! in true))))
